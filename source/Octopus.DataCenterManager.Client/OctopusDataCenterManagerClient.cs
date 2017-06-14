@@ -1,134 +1,60 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Net;
-using System.Text;
-using Newtonsoft.Json;
-using Octopus.Client.Exceptions;
-using Octopus.Client.Model;
-using Octopus.Client.Serialization;
-using System.Collections.Generic;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Net.Security;
+using System.Reflection;
 using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using System.Threading.Tasks;
-using Octopus.Client.Extensions;
-using Octopus.Client.Logging;
-using Octopus.Client.Util;
+using Newtonsoft.Json;
+using Octopus.DataCenterManager.Client.Logging;
 
-namespace Octopus.Client
+namespace Octopus.DataCenterManager.Client
 {
-    /// <summary>
-    /// The Octopus Deploy RESTful HTTP API client.
-    /// </summary>
-    public class OctopusAsyncClient : IOctopusAsyncClient
+    public interface IOctopusDataCenterManagerClient
     {
-        private static readonly ILog Logger = LogProvider.For<OctopusAsyncClient>();
+        
+    }
 
-        readonly OctopusServerEndpoint serverEndpoint;
-        readonly JsonSerializerSettings defaultJsonSerializerSettings = JsonSerialization.GetDefaultSerializerSettings();
+   
+
+    public class OctopusDataCenterManagerClient : IOctopusDataCenterManagerClient
+    {
+        private readonly OctopusDataCenterManagerEndpoint endpoint;
+        private static readonly ILog Logger = LogProvider.For<OctopusDataCenterManagerClient>();
+
+        readonly JsonSerializerSettings defaultJsonSerializerSettings = new JsonSerializerSettings();
         private readonly HttpClient client;
-        private readonly CookieContainer cookieContainer = new CookieContainer();
-        private readonly Uri cookieOriginUri;
-        private readonly bool ignoreSslErrors = false;
-        bool ignoreSslErrorMessageLogged = false;
 
-        protected OctopusAsyncClient(OctopusServerEndpoint serverEndpoint, OctopusClientOptions options, bool addCertificateCallback)
+        protected OctopusDataCenterManagerClient(OctopusDataCenterManagerEndpoint endpoint)
         {
-            options = options ?? new OctopusClientOptions();
-            Repository = new OctopusAsyncRepository(this);
-
-            this.serverEndpoint = serverEndpoint;
-            cookieOriginUri = BuildCookieUri(serverEndpoint);
-            var handler = new HttpClientHandler
-            {
-                CookieContainer = cookieContainer,
-                Credentials = serverEndpoint.Credentials ?? CredentialCache.DefaultNetworkCredentials,
-            };
-
-            if (options.Proxy != null)
+            this.endpoint = endpoint;
+            Repository = new OctopusDataCenterManagerRepository(this);
+            var handler = new HttpClientHandler();
+            if (endpoint.Proxy != null)
             {
                 handler.UseProxy = true;
-                handler.Proxy = new ClientProxy(options.Proxy, options.ProxyUsername, options.ProxyPassword);
+                handler.Proxy = endpoint.Proxy;
             }
-
-#if HTTP_CLIENT_SUPPORTS_SSL_OPTIONS
-            handler.SslProtocols = options.SslProtocols;
-            if(addCertificateCallback)
-            {
-                ignoreSslErrors = options.IgnoreSslErrors;
-                handler.ServerCertificateCustomValidationCallback = IgnoreServerCertificateCallback;
-            }
-#endif
-
-            if (serverEndpoint.Proxy != null)
-                handler.Proxy = serverEndpoint.Proxy;
-
+            
             client = new HttpClient(handler, true);
-            client.Timeout = serverEndpoint.RequestTimeout == ApiConstants.DefaultClientRequestTimeoutTimespan ? options.Timeout : serverEndpoint.RequestTimeout;
+            client.Timeout = endpoint.Timeout;
             client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-            client.DefaultRequestHeaders.Add(ApiConstants.ApiKeyHttpHeaderName, serverEndpoint.ApiKey);
-            client.DefaultRequestHeaders.Add("User-Agent", $"{ApiConstants.OctopusUserAgentProductName}/{GetType().GetSemanticVersion().ToNormalizedString()}");
+            client.DefaultRequestHeaders.Add("X-Octopus-ApiKey", endpoint.ApiKey);
+            client.DefaultRequestHeaders.Add("User-Agent", $"OctopusDataCenterManagerClient-dotnet/{GetType().GetTypeInfo().Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion}");
         }
 
-        private Uri BuildCookieUri(OctopusServerEndpoint octopusServerEndpoint)
+        public static Task<IOctopusDataCenterManagerClient> Create(string serverAddress, string apiKey)
+            => Create(new OctopusDataCenterManagerEndpoint(serverAddress, apiKey));
+
+        public static async Task<IOctopusDataCenterManagerClient> Create(OctopusDataCenterManagerEndpoint endpoint)
         {
-            // The CookieContainer is a bit funny - it sets the cookie without the port, but doesn't ignore the port when retreiving cookies
-            // From what I can see it uses the Uri.Authority value - which contains the port number
-            // We need to clear the port in order to successfully get cookies for the same origin
-            var uriBuilder = new UriBuilder(octopusServerEndpoint.OctopusServer.Resolve("/")) {Port = 0};
-            return uriBuilder.Uri;
-        }
-
-        private bool IgnoreServerCertificateCallback(HttpRequestMessage message, X509Certificate2 certificate, X509Chain chain, SslPolicyErrors errors)
-        {
-            if (errors == SslPolicyErrors.None)
-            {
-                return true;
-            }
-
-            var warning = $@"The following certificate errors were encountered when establishing the HTTPS connection to the server: {errors}
-Certificate subject name: {certificate.SubjectName.Name}
-Certificate thumbprint:   {certificate.Thumbprint}";
-
-            if (ignoreSslErrors)
-            {
-                if (!ignoreSslErrorMessageLogged)
-                {
-                    Logger.Warn(warning);
-                    Logger.Warn("Because IgnoreSslErrors was set, this will be ignored.");
-                    ignoreSslErrorMessageLogged = true;
-                }
-                return true;
-            }
-
-            Logger.Error(warning);
-            return false;
-        }
-
-        public static async Task<IOctopusAsyncClient> Create(OctopusServerEndpoint serverEndpoint, OctopusClientOptions options = null)
-        {
-#if HTTP_CLIENT_SUPPORTS_SSL_OPTIONS
-            try
-            {
-                return await Create(serverEndpoint, options, true);
-            }
-            catch (PlatformNotSupportedException)
-            {
-                if (options?.IgnoreSslErrors ?? false)
-                    throw new Exception("This platform does not support ignoring SSL certificate errors");
-                return await Create(serverEndpoint, options, false);
-            }
-#else
-            return await Create(serverEndpoint, options, false);
-#endif
-        }
-
-        private static async Task<IOctopusAsyncClient> Create(OctopusServerEndpoint serverEndpoint, OctopusClientOptions options, bool addHandler)
-        {
-            var client = new OctopusAsyncClient(serverEndpoint, options ?? new OctopusClientOptions(), addHandler);
+            var client = new OctopusDataCenterManagerClient(endpoint);
             try
             {
                 client.RootDocument = await client.EstablishSession().ConfigureAwait(false);
@@ -146,7 +72,7 @@ Certificate thumbprint:   {certificate.Thumbprint}";
         /// server. Instead of hardcoding paths,
         /// clients should use these link properties to traverse the resources on the server. This document is lazily loaded so
         /// that it is only requested once for
-        /// the current <see cref="IOctopusAsyncClient" />.
+        /// the current <see cref="IOctopusDataCenterManagerClient" />.
         /// </summary>
         public RootResource RootDocument { get; private set; }
 
@@ -197,7 +123,7 @@ Certificate thumbprint:   {certificate.Thumbprint}";
             return response.ResponseResource;
         }
 
-        public IOctopusAsyncRepository Repository { get; }
+        public IOctopusDataCenterManagerRepository Repository { get; }
 
         /// <summary>
         /// Fetches a collection of resources from the server using the HTTP GET verb. The collection itself will usually be
@@ -445,7 +371,7 @@ Certificate thumbprint:   {certificate.Thumbprint}";
 
             path = (dictionary == null) ? UrlTemplate.Resolve(path, parameters) : UrlTemplate.Resolve(path, dictionary);
 
-            return serverEndpoint.OctopusServer.Resolve(path);
+            return endpoint.LinkResolver.Resolve(path);
         }
 
         protected virtual async Task<RootResource> EstablishSession()
@@ -494,15 +420,9 @@ Certificate thumbprint:   {certificate.Thumbprint}";
                 retries--;
             }
 
-            if (string.IsNullOrWhiteSpace(server.ApiVersion))
-                throw new UnsupportedApiVersionException("This Octopus Deploy server uses an older API specification than this tool can handle. Please check for updates to the Octo tool.");
-
-            var min = SemanticVersion.Parse(ApiConstants.SupportedApiSchemaVersionMin);
-            var max = SemanticVersion.Parse(ApiConstants.SupportedApiSchemaVersionMax);
-            var current = SemanticVersion.Parse(server.ApiVersion);
-
-            if (current < min || current > max)
-                throw new UnsupportedApiVersionException($"This Octopus Deploy server uses a newer API specification ({server.ApiVersion}) than this tool can handle ({ApiConstants.SupportedApiSchemaVersionMin} to {ApiConstants.SupportedApiSchemaVersionMax}). Please check for updates to this tool.");
+            var apiVersion = Version.Parse(server.ApiVersion);
+            if (apiVersion.Major > 1)
+                throw new UnsupportedApiVersionException($"This Octopus Deploy server uses a newer API specification ({server.ApiVersion}) than this library can handle (1.x.x). Please check for updates to this library.");
 
             return server;
         }
